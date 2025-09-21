@@ -38,6 +38,7 @@ saxpy_kernel(int N, float alpha, float* x, float* y, float* result) {
 // memory on the GPU using CUDA API functions, uses CUDA API functions
 // to transfer data from the CPU's memory address space to GPU memory
 // address space, and launches the CUDA kernel function on the GPU.
+// 这个函数被调用时还在 CPU 上运行
 void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultarray) {
 
     // must read both input arrays (xarray and yarray) and write to
@@ -75,6 +76,10 @@ void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultar
     //
     // https://devblogs.nvidia.com/easy-introduction-cuda-c-and-c/
     //
+    // 分配GPU设备内存
+    cudaMalloc((void**)&device_x, sizeof(float) * N);
+    cudaMalloc((void**)&device_y, sizeof(float) * N);
+    cudaMalloc((void**)&device_result, sizeof(float) * N);
         
     // start timing after allocation of device memory
     double startTime = CycleTimer::currentSeconds();
@@ -82,16 +87,24 @@ void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultar
     //
     // CS149 TODO: copy input arrays to the GPU using cudaMemcpy
     //
-
+    // 拷贝数据到设备
+    cudaMemcpy(device_x, xarray, sizeof(float) * N, cudaMemcpyHostToDevice);
+    cudaMemcpy(device_y, yarray, sizeof(float) * N, cudaMemcpyHostToDevice);
    
+    double startKernelTime = CycleTimer::currentSeconds();
+    // 运行 cuda 内核
     // run CUDA kernel. (notice the <<< >>> brackets indicating a CUDA
     // kernel launch) Execution on the GPU occurs here.
     saxpy_kernel<<<blocks, threadsPerBlock>>>(N, alpha, device_x, device_y, device_result);
+    // cuda 内核和CPU程序默认是异步的，因此要加同步代码
+    cudaDeviceSynchronize();
+    double endKernelTime = CycleTimer::currentSeconds();
 
+    // 把结果数据拷贝回主机
     //
     // CS149 TODO: copy result from GPU back to CPU using cudaMemcpy
     //
-
+    cudaMemcpy(resultarray, device_result, sizeof(float) * N, cudaMemcpyDeviceToHost);
     
     // end timing after result has been copied back into host memory
     double endTime = CycleTimer::currentSeconds();
@@ -105,9 +118,16 @@ void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultar
     double overallDuration = endTime - startTime;
     printf("Effective BW by CUDA saxpy: %.3f ms\t\t[%.3f GB/s]\n", 1000.f * overallDuration, GBPerSec(totalBytes, overallDuration));
 
+    double overallKernelDuration = endKernelTime - startKernelTime;
+    printf("Kernel time: %.3f ms\t\t[%.3f GB/s]\n", 1000.f * overallKernelDuration, GBPerSec(totalBytes, overallKernelDuration));
+
     //
     // CS149 TODO: free memory buffers on the GPU using cudaFree
     //
+    // 清理资源
+    cudaFree(device_x);
+    cudaFree(device_y);
+    cudaFree(device_result);
     
 }
 
