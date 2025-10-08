@@ -66,7 +66,7 @@ void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultar
     float* device_x = nullptr;
     float* device_y = nullptr;
     float* device_result = nullptr;
-    
+
     //
     // CS149 TODO: allocate device memory buffers on the GPU using cudaMalloc.
     //
@@ -80,7 +80,12 @@ void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultar
     cudaMalloc((void**)&device_x, sizeof(float) * N);
     cudaMalloc((void**)&device_y, sizeof(float) * N);
     cudaMalloc((void**)&device_result, sizeof(float) * N);
-        
+
+    // pinned memory 分配内存
+    cudaHostAlloc(&xarray, sizeof(float) * N, cudaHostAllocDefault);
+    cudaHostAlloc(&yarray, sizeof(float) * N, cudaHostAllocDefault);
+    cudaHostAlloc(&resultarray, sizeof(float) * N, cudaHostAllocDefault);
+
     // start timing after allocation of device memory
     double startTime = CycleTimer::currentSeconds();
 
@@ -128,6 +133,11 @@ void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultar
     cudaFree(device_x);
     cudaFree(device_y);
     cudaFree(device_result);
+
+    // pinned memory
+    cudaFreeHost(xarray);
+    cudaFreeHost(yarray);
+    cudaFreeHost(resultarray);
     
 }
 
