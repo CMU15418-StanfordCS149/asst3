@@ -27,6 +27,44 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+// 排除前缀和的核函数
+__global__ void gpu_exclusive_scan(int* input, int N, int* result) {
+    // 计算线程对应的矩阵位置
+    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // 这里只用一个线程来执行前缀和算法
+    if(thread_id != 0)
+        return;
+    
+    // 复制输入数组到输出数组
+    // memmove(result, input, N*sizeof(int));
+    for(int i = 0; i < N; i++) {
+        result[i] = input[i];
+    }
+    
+    // upsweep阶段
+    for (int two_d = 1; two_d <= N/2; two_d*=2) {
+        int two_dplus1 = 2*two_d;
+        // parallel_for (int i = 0; i < N; i += two_dplus1) {
+        for (int i = 0; i < N; i += two_dplus1) {
+            result[i+two_dplus1-1] += result[i+two_d-1];
+        }
+    }
+
+    result[N-1] = 0;
+
+    // downsweep阶段
+    for (int two_d = N/2; two_d >= 1; two_d /= 2) {
+        int two_dplus1 = 2*two_d;
+        // parallel_for (int i = 0; i < N; i += two_dplus1) {
+        for (int i = 0; i < N; i += two_dplus1) {
+            int t = result[i+two_d-1];
+            result[i+two_d-1] = result[i+two_dplus1-1];
+            result[i+two_dplus1-1] += t;
+        }
+    }
+}
+
 // exclusive_scan --
 //
 // Implementation of an exclusive scan on global memory array `input`,
@@ -44,16 +82,22 @@ static inline int nextPow2(int n) {
 // places it in result
 void exclusive_scan(int* input, int N, int* result)
 {
-
     // CS149 TODO:
-    //
     // Implement your exclusive scan implementation here.  Keep in
     // mind that although the arguments to this function are device
     // allocated arrays, this is a function that is running in a thread
     // on the CPU.  Your implementation will need to make multiple calls
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
+    // 注意：这个函数是在CPU上运行的，但是传入的参数input/result是GPU上的数组
 
+    // 定义线程块和网格大小
+    int blockSize = 256;  // 256个线程/块
+    int gridSize = (N + blockSize - 1) / blockSize; // 计算需要多少个块
+    // 计算下一个2次幂，方便简化算法的计算
+    int rounded_length = nextPow2(N);
+
+    gpu_exclusive_scan<<<gridSize, blockSize>>>(input, rounded_length, result);
 
 }
 
@@ -102,6 +146,14 @@ double cudaScan(int* inarray, int* end, int* resultarray)
     double endTime = CycleTimer::currentSeconds();
        
     cudaMemcpy(resultarray, device_result, (end - inarray) * sizeof(int), cudaMemcpyDeviceToHost);
+
+    // // 自己添加的调试代码：
+    // for(int i = 0; i < N; i++) {
+    //     printf("inarray[%d] = %d\n", i, inarray[i]);
+    // }
+    // for(int i = 0; i < N; i++) {
+    //     printf("resultarray[%d] = %d\n", i, resultarray[i]);
+    // }
 
     double overallDuration = endTime - startTime;
     return overallDuration; 
