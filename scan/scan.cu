@@ -107,36 +107,41 @@ void exclusive_scan(int* input, int N, int* result, int* debug)
     int blockSize = THREADS_PER_BLOCK;  // 256个线程/块
     // 计算下一个2次幂，方便简化算法的计算 (这在最坏情况会引入2倍工作负载)
     int rounded_length = nextPow2(N);
-    // 使用 rounded_length 计算 gridSize
-    int gridSize = (rounded_length + blockSize - 1) / blockSize;
+    // // 使用 rounded_length 计算 gridSize
+    // int gridSize = (rounded_length + blockSize - 1) / blockSize;
 
     // cudaScan 函数已经让 result/debug 数组完全等同 input 数组，这里不需要再 memmove
 
     // upsweep阶段
     for (int two_d = 1; two_d <= rounded_length/2; two_d*=2) {
-        // // only launch as many threads as needed for this stride
-        // int activeThreads = rounded_length / (2 * two_d);
-        // int grid = (activeThreads + blockSize - 1) / blockSize;
-        // if (grid > 0) {
-        gpu_upsweep<<<gridSize, blockSize>>>(result, rounded_length, two_d);
-        // gpu_print<<<gridSize, blockSize>>>(result, N);
-        // }
+        // gpu_upsweep<<<gridSize, blockSize>>>(result, rounded_length, two_d);
+        // 只启动需要的线程
+        // 计算需要的线程
+        int activeThreads = rounded_length / (2 * two_d);
+        // 用这个数字计算网格大小
+        int grid = (activeThreads + blockSize - 1) / blockSize;
+        // 启动 CUDA 内核函数
+        if (grid > 0) {
+            gpu_upsweep<<<grid, blockSize>>>(result, rounded_length, two_d);
+        }
     }
 
     // 设置最后一个元素为0
-    // gpu_setzero<<<1, 1>>>(result, rounded_length);
-    gpu_setzero<<<gridSize, blockSize>>>(result, rounded_length);
-    // gpu_print<<<gridSize, blockSize>>>(result, N);
+    // gpu_setzero<<<gridSize, blockSize>>>(result, rounded_length);
+    // 这里只需要一个线程 0
+    gpu_setzero<<<1, 1>>>(result, rounded_length);
 
     // downsweep阶段
     for (int two_d = rounded_length/2; two_d >= 1; two_d /= 2) {
-        // int activeThreads = rounded_length / (2 * two_d);
-        // int grid = (activeThreads + blockSize - 1) / blockSize;
-        // if (grid > 0) {
-        //     gpu_downsweep<<<grid, blockSize>>>(result, rounded_length, two_d);
-        // }
-        gpu_downsweep<<<gridSize, blockSize>>>(result, rounded_length, two_d);
-        // gpu_print<<<gridSize, blockSize>>>(result, N);
+        // gpu_downsweep<<<gridSize, blockSize>>>(result, rounded_length, two_d);
+        // 只启动需要的线程
+        // 计算需要的线程
+        int activeThreads = rounded_length / (2 * two_d);
+        // 用这个数字计算网格大小
+        int grid = (activeThreads + blockSize - 1) / blockSize;
+        if (grid > 0) {
+            gpu_downsweep<<<grid, blockSize>>>(result, rounded_length, two_d);
+        }
     }
 }
 
