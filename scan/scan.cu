@@ -29,7 +29,7 @@ static inline int nextPow2(int n) {
 __global__ void gpu_print(int* result, int N) {
     // 线程块内的 ID: threadIdx.x
     // 计算全局 CUDA 线程ID
-    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    long long thread_id = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if(thread_id > 0)
         return;
     for(int i = 0; i < N; i++) {
@@ -39,17 +39,21 @@ __global__ void gpu_print(int* result, int N) {
 
 __global__ void gpu_upsweep(int* result, int rounded_length, int two_d) {
     // 线程块内的 ID: threadIdx.x
-    // 计算全局 CUDA 线程ID
-    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
-    // 防止越界
-    if(thread_id*2*two_d + 2*two_d - 1 < rounded_length)
-        result[thread_id*2*two_d + 2*two_d - 1] += result[thread_id*2*two_d + two_d - 1];
+    // 计算全局 CUDA 线程ID（使用64位以防止乘法溢出）
+    long long thread_id = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long two_d_ll = (long long)two_d;
+    long long left_idx = thread_id*2*two_d_ll + two_d_ll - 1;
+    long long right_idx = thread_id*2*two_d_ll + 2*two_d_ll - 1;
+    // 防止越界（比较也用64位）
+    if (right_idx < (long long)rounded_length) {
+        result[right_idx] += result[left_idx];
+    }
 }
 
 __global__ void gpu_setzero(int* result, int rounded_length) {
     // 线程块内的 ID: threadIdx.x
-    // 计算全局 CUDA 线程ID
-    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    // 计算全局 CUDA 线程ID（使用64位以防止溢出）
+    long long thread_id = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     // 只让线程 0 更新这个元素
     if(thread_id == 0) {
         result[rounded_length - 1] = 0;
@@ -58,13 +62,16 @@ __global__ void gpu_setzero(int* result, int rounded_length) {
 
 __global__ void gpu_downsweep(int* result, int rounded_length, int two_d) {
     // 线程块内的 ID: threadIdx.x
-    // 计算全局 CUDA 线程ID
-    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    // 计算全局 CUDA 线程ID（使用64位以防止乘法溢出）
+    long long thread_id = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long two_d_ll = (long long)two_d;
+    long long left_idx = thread_id*2*two_d_ll + two_d_ll - 1;
+    long long right_idx = thread_id*2*two_d_ll + 2*two_d_ll - 1;
     // 防止越界
-    if (thread_id*2*two_d + 2*two_d - 1 < rounded_length) {
-        int t = result[thread_id*2*two_d + two_d - 1];
-        result[thread_id*2*two_d + two_d - 1] = result[thread_id*2*two_d + 2*two_d - 1];
-        result[thread_id*2*two_d + 2*two_d - 1] += t;
+    if (right_idx < (long long)rounded_length) {
+        int t = result[left_idx];
+        result[left_idx] = result[right_idx];
+        result[right_idx] += t;
     }
 }
 
