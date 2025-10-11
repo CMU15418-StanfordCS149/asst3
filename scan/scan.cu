@@ -33,7 +33,7 @@ __global__ void gpu_print(int* result, int N) {
     if(thread_id > 0)
         return;
     for(int i = 0; i < N; i++) {
-        printf("result[%d] = %d\n", i, result[i]);
+        printf("gpu_print: result[%d] = %d\n", i, result[i]);
     }
 }
 
@@ -242,6 +242,34 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration; 
 }
 
+// 这里对于大于 length 的位置全部标为 0
+__global__ void gpu_mark1forNeighborSame(int* input, int length, int rounded_length, int* output) {
+    // 线程块内的 ID: threadIdx.x
+    // 计算全局 CUDA 线程ID（使用64位以防止乘法溢出）
+    long long thread_id = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if(thread_id < rounded_length) {
+        if(thread_id < length-1) {
+            // 只要和下一个元素相等就标1
+            output[thread_id] = input[thread_id] == input[thread_id + 1] ? 1 : 0;
+        } else {
+            // 大于等于 length 的部分全部标0
+            output[thread_id] = 0;
+        }
+    }
+}
+
+// 遍历输入数组，把所有 input[i] != input[i+1] 的索引写入 output
+__global__ void gpu_findrepeats_helper(int* input, int length, int* output) {
+    // 线程块内的 ID: threadIdx.x
+    // 计算全局 CUDA 线程ID（使用64位以防止乘法溢出）
+    long long thread_id = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if(thread_id < length) {
+        if(input[thread_id] != input[thread_id + 1]) {
+            // 这里直接把索引写入 output
+            output[input[thread_id]] = thread_id;
+        }
+    }
+}
 
 // find_repeats --
 //
@@ -262,8 +290,43 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // exclusive_scan function with them. However, your implementation
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
+    // 为什么要用下面这种复杂的方式求重复数据索引？答：常规方式并行度不高，因此使用这种方式
+    // 这里的思路是:
+    // 1. 先计算一个辅助数组 aux，aux[i] = 1 if input[i] == input[i+1] else 0
+    // 2. 对 aux 做一个 exclusive scan，得到 aux_scan
+    // 3. 再对 aux_scan 做一个遍历，把所有 "aux_scan[i] != aux_scan[i+1]" 索引写入 output
+    // 4. aux_scan 最后一个元素的值就是重复数据的个数
 
-    return 0; 
+    // gpu_print<<<1,1>>>(device_input, length);
+
+    // 定义线程块和网格大小
+    int blockSize = THREADS_PER_BLOCK;  // 256个线程/块
+    // 计算下一个2次幂，方便简化算法的计算 (这在最坏情况会引入2倍工作负载)
+    int rounded_length = nextPow2(length);
+    // 使用 rounded_length 计算 gridSize
+    int gridSize = (rounded_length + blockSize - 1) / blockSize;
+
+    // 申请临时 cuda 数组
+    int* device_tmp;
+    cudaMalloc((void**)&device_tmp, rounded_length * sizeof(int));
+
+    // 1. 先计算一个辅助数组 aux，aux[i] = 1 if input[i] == input[i+1] else 0
+    gpu_mark1forNeighborSame<<<gridSize, blockSize>>>(device_input, length, rounded_length, device_tmp);
+    // gpu_print<<<1,1>>>(device_tmp, length);
+    // 2. 对 aux 做一个 exclusive scan，得到 aux_scan
+    exclusive_scan(device_tmp, length, device_tmp, nullptr);
+    // gpu_print<<<1,1>>>(device_tmp, length);
+    // 4. aux_scan 最后一个元素的值就是重复数据的个数
+    int repeats_num;
+    cudaMemcpy(&repeats_num, &device_tmp[length - 1], sizeof(int),
+            cudaMemcpyDeviceToHost);
+    // 3. 再对 aux_scan 做一个遍历，把所有 "aux_scan[i] != aux_scan[i+1]" 索引写入 output
+    gpu_findrepeats_helper<<<gridSize, blockSize>>>(device_tmp, length, device_output);
+
+    // 释放临时 CUDA 数组
+    cudaFree(device_tmp);
+    // 返回重复数据个数
+    return repeats_num; 
 }
 
 
@@ -276,6 +339,11 @@ double cudaFindRepeats(int *input, int length, int *output, int *output_length) 
     int *device_input;
     int *device_output;
     int rounded_length = nextPow2(length);
+
+    // // 自己添加的调试代码：
+    // for(int i = 0; i < length; i++) {
+    //     printf("input[%d] = %d\n", i, input[i]);
+    // }
     
     cudaMalloc((void **)&device_input, rounded_length * sizeof(int));
     cudaMalloc((void **)&device_output, rounded_length * sizeof(int));
