@@ -58,7 +58,7 @@ clean:
 		rm -rf $(OBJDIR) *~ $(EXECUTABLE) $(LOGS)
 
 check:	default
-		./checker.pl
+		./checker.py
 
 $(EXECUTABLE): dirs $(OBJS)
 		$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(LDFLAGS) $(LDLIBS) $(LDFRAMEWORKS)
