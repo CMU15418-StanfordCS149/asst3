@@ -318,15 +318,16 @@ __global__ void kernelAdvanceSnowflake() {
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
 __device__ __inline__ void
+// 计算当前像素的颜色，参数包括 1.圆圈索引 2.像素中心坐标 3.圆圈位置 4.像素颜色数据地址
 shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
-
+    // 计算像素中心坐标距离圆圈位置的距离(的平方)
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
-
+    // 获取圆圈半径(的平方)
     float rad = cuConstRendererParams.radius[circleIndex];;
     float maxDist = rad * rad;
-
+    // 如果像素距离大于半径，那么这个圆圈在这个像素上就没有颜色，直接返回
     // circle does not contribute to the image
     if (pixelDist > maxDist)
         return;
@@ -342,6 +343,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     // would be wise to perform this logic outside of the loop next in
     // kernelRenderCircles.  (If feeling good about yourself, you
     // could use some specialized template magic).
+    // 雪景下的计算
     if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
 
         const float kCircleMaxAlpha = .5f;
@@ -355,24 +357,32 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
         alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
 
     } else {
+        // 圆圈场景下的计算
         // simple: each circle has an assigned color
+        // 获取当前圆圈的颜色数据
         int index3 = 3 * circleIndex;
         rgb = *(float3*)&(cuConstRendererParams.color[index3]);
+        // 圆圈场景下，所有圆圈的透明度都是 0.5
         alpha = .5f;
     }
 
+    // 1 - 透明度，显示度 ?
     float oneMinusAlpha = 1.f - alpha;
 
     // BEGIN SHOULD-BE-ATOMIC REGION
     // global memory read
 
+    // 获取当前像素上的颜色
     float4 existingColor = *imagePtr;
+    // 储存要计算的新颜色
     float4 newColor;
+    // 计算合成颜色的公式
     newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
     newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
     newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
     newColor.w = alpha + existingColor.w;
 
+    // 更新像素颜色数据
     // global memory write
     *imagePtr = newColor;
 
@@ -386,17 +396,20 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 // resulting image will be incorrect.
 __global__ void kernelRenderCircles() {
 
+    // 计算全局 thread_id (也作为圆圈索引使用)
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-
+    // 如果线程 ID > 圆圈数量，直接返回
     if (index >= cuConstRendererParams.numCircles)
         return;
-
+    // thread_id x 3，用于访问圆圈位置数组，至于为什么要 x 3，这跟 position 的数据类型定义是 float * 有关
     int index3 = 3 * index;
 
-    // read position and radius
+    // 读取圆圈位置，使用 index x 3 作为索引，一次读取三个 float 数据
     float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+    // 使用线程索引获取圆圈的半径
     float  rad = cuConstRendererParams.radius[index];
 
+    // 计算这个圆圈的 “盒子”，从下面的计算公式来看，左边 x,y 以及半径 rad 都是归一化到 [0,1] 之间的
     // compute the bounding box of the circle. The bound is in integer
     // screen coordinates, so it's clamped to the edges of the screen.
     short imageWidth = cuConstRendererParams.imageWidth;
@@ -405,23 +418,32 @@ __global__ void kernelRenderCircles() {
     short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
     short minY = static_cast<short>(imageHeight * (p.y - rad));
     short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
-
+    // 如果盒子大小超越屏幕边界，那么就以屏幕边界作为盒子边界
+    // 计算后，下面四个 short 类型变量就是该圆圈的盒子边界
     // a bunch of clamps.  Is there a CUDA built-in for this?
     short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
     short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
     short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
     short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
 
+    // 计算整张图片的宽高倒数
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
 
+    // 针对盒子里所有的像素遍历，两个 for 循环，一个遍历 y 轴，一个遍历 x 轴
     // for all pixels in the bonding box
     for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
+        // 4D 浮点数，包括 RGB 和 透明度
+        // 获取当前 y 上，盒子内第一个像素的颜色数据地址
         float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
+        // 遍历盒子内的 x 轴上的所有像素，这些像素是连续的，颜色数据内存地址也连续
         for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
+            // 计算当前像素中心点在 [0,1] 归一化坐标内的位置
             float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                                  invHeight * (static_cast<float>(pixelY) + 0.5f));
+            // 计算当前像素的颜色，参数包括 1.圆圈索引 2.像素中心坐标 3.圆圈位置 4.像素颜色数据地址
             shadePixel(index, pixelCenterNorm, p, imgPtr);
+            // 获取下一个像素的颜色数据
             imgPtr++;
         }
     }
@@ -635,11 +657,12 @@ CudaRenderer::advanceAnimation() {
 
 void
 CudaRenderer::render() {
-
     // 256 threads per block is a healthy number
     dim3 blockDim(256, 1);
+    // 按照圆圈数量分配线程，圆圈数 = 线程数
     dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
-
+    // cuda 渲染核心代码
     kernelRenderCircles<<<gridDim, blockDim>>>();
+    // 确保所有之前发出的、与当前设备(GPU)关联的主机(CPU)线程中的 CUDA API 调用都已完成执行。
     cudaDeviceSynchronize();
 }
