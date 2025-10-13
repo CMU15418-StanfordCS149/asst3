@@ -432,44 +432,6 @@ __global__ void kernelRenderCircles() {
                    (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]));
     }
 
-    // // thread_id x 3，用于访问圆圈位置数组，至于为什么要 x 3，这跟 position 的数据类型定义是 float * 有关
-    // int index3 = 3 * index;
-
-    // // 读取圆圈位置，使用 index x 3 作为索引，一次读取三个 float 数据
-    // float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    // // 使用线程索引获取圆圈的半径
-    // float  rad = cuConstRendererParams.radius[index];
-
-    // // 计算这个圆圈的 “盒子”，从下面的计算公式来看，左边 x,y 以及半径 rad 都是归一化到 [0,1] 之间的
-    // // compute the bounding box of the circle. The bound is in integer
-    // // screen coordinates, so it's clamped to the edges of the screen.
-    // short minX = static_cast<short>(imageWidth * (p.x - rad));
-    // short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    // short minY = static_cast<short>(imageHeight * (p.y - rad));
-    // short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
-    // // 如果盒子大小超越屏幕边界，那么就以屏幕边界作为盒子边界
-    // // 计算后，下面四个 short 类型变量就是该圆圈的盒子边界
-    // // a bunch of clamps.  Is there a CUDA built-in for this?
-    // short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    // short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    // short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    // short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
-
-
-    // // 针对盒子里所有的像素遍历，两个 for 循环，一个遍历 y 轴，一个遍历 x 轴
-    // // for all pixels in the bonding box
-    // for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
-    //     // 4D 浮点数，包括 RGB 和 透明度
-    //     // 获取当前 y 上，盒子内第一个像素的颜色数据地址
-    //     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
-    //     // 遍历盒子内的 x 轴上的所有像素，这些像素是连续的，颜色数据内存地址也连续
-    //     for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
-    //         // 计算当前像素的颜色，参数包括 1.圆圈索引 2.像素中心坐标 3.圆圈位置 4.像素颜色数据地址
-    //         shadePixel(index, pixelCenterNorm, p, imgPtr);
-    //         // 获取下一个像素的颜色数据
-    //         imgPtr++;
-    //     }
-    // }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
