@@ -14,6 +14,72 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+#define BLOCK_DIM_X 16
+#define BLOCK_DIM_Y 16
+
+// 用于检验 “圆圈是否与矩形相交或被包含” 的函数
+// circleInBoxConservative --
+//
+// Tests whether circle with center (circleX, circleY) and radius
+// `circleRadius` *may intersect* the box defined by coordinates for
+// it's left and right sides, and top and bottom edges.  For
+// efficiency, this is a conservative test.  If it returns 0, then the
+// circle definitely does not intersect the box.  However a result of
+// 1 does not imply an intersection actually exists.  Further tests
+// are needed to determine if an intersection actually exists.  For
+// example, you could continue with actual point in circle tests, or
+// make a subsequent call to circleInBox().
+// Note: For a valid Box, you will want to use boxR >= boxL and 
+// boxT >= boxB. 
+__device__ __inline__ int
+circleInBoxConservative(
+    float circleX, float circleY, float circleRadius,
+    float boxL, float boxR, float boxT, float boxB)
+{
+
+    // expand box by circle radius.  Test if circle center is in the
+    // expanded box.
+
+    if ( circleX >= (boxL - circleRadius) &&
+         circleX <= (boxR + circleRadius) &&
+         circleY >= (boxB - circleRadius) &&
+         circleY <= (boxT + circleRadius) ) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+// 用于检验 “圆圈是否与矩形相交或被包含” 的函数
+// circleInBox --
+//
+// This is a true circle in box test.  It is more expensive than the
+// function circleInBoxConservative above, but it's 1/0 result is a
+// definitive result.
+// Note: For a valid Box, you will want to use boxR >= boxL and 
+// boxT >= boxB. 
+__device__ __inline__ int
+circleInBox(
+    float circleX, float circleY, float circleRadius,
+    float boxL, float boxR, float boxT, float boxB)
+{
+
+    // clamp circle center to box (finds the closest point on the box)
+    float closestX = (circleX > boxL) ? ((circleX < boxR) ? circleX : boxR) : boxL;
+    float closestY = (circleY > boxB) ? ((circleY < boxT) ? circleY : boxT) : boxB;
+
+    // is circle radius less than the distance to the closest point on
+    // the box?
+    float distX = closestX - circleX;
+    float distY = closestY - circleY;
+
+    if ( ((distX*distX) + (distY*distY)) <= (circleRadius*circleRadius) ) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -30,7 +96,6 @@ struct GlobalConstants {
 
     int imageWidth;
     int imageHeight;
-    int numPixels;
     float* imageData;
 };
 
@@ -395,43 +460,81 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 // Each thread renders a circle.  Since there is no protection to
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
+// 1.把整个图片切块，分成矩形，举个例子，16x16的矩形。矩形里一共有 256 个像素，正好是一个线程块的线程数
+// 2.线程块内所有线程一起计算矩形的上边、下边、左边、右边，随后遍历圆形数组，筛出所有与矩形相交、或者在矩形内部的圆。
+// 3.再对矩形内部的像素，遍历 “已经别筛出的圆”，计算颜色。
 __global__ void kernelRenderCircles() {
-
-    // 计算全局 thread_id (也作为像素索引使用)
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    // 如果线程 ID > 像素数量，直接返回
-    if (index >= cuConstRendererParams.numPixels)
-        return;
-
-    // 整体渲染算法设计：
-    // 对于每个像素:
-    //     计算像素中心点
-    //     遍历圆圈数组 (按索引顺序):
-    //        (下面这三行在 shadePixel() 函数中都已经实现了)
-    //        如果当前圆圈包含了这个像素中心点
-    //        计算圆圈在当前像素上的颜色
-    //        在当前像素上混合颜色
-
-    // 根据线程 ID 计算当前像素的 x,y 坐标
-    int pixelX = index % cuConstRendererParams.imageWidth;
-    int pixelY = index / cuConstRendererParams.imageWidth;
-    // 计算当前像素中心点在 [0,1] 归一化坐标内的位置
-    // 计算整张图片的宽高倒数
-    short imageWidth = cuConstRendererParams.imageWidth;
+    // 计算线程块内的索引
+    int indexInBlock = blockDim.x*threadIdx.y + threadIdx.x;
+    // 计算像素点的 x, y
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    short imageWidth  = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
-    float invWidth = 1.f / imageWidth;
+    // 过滤掉越界的线程 (NOTE: 这里不能过滤掉越界的线程，因为需要这些线程完成圆圈矩阵相交的运算，绘图时再过滤即可)
+    // if (pixelX >= imageWidth || pixelY >= imageHeight)
+    //     return;
+
+    // 计算归一化的像素中心点坐标
+    float invWidth  = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
     float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                             invHeight * (static_cast<float>(pixelY) + 0.5f));
-            
-    // 遍历圆圈数组 (按索引顺序):
-    for(int circleIndex = 0; circleIndex < cuConstRendererParams.numCircles; circleIndex++) {
-        // 计算当前圆圈对当前像素的颜色贡献
-        shadePixel(circleIndex, pixelCenterNorm,
-                   *(float3*)(&cuConstRendererParams.position[3*circleIndex]),
-                   (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]));
-    }
 
+    // 线程块内线程共享的共享内存，包括: (线程块的共享内存 L1 cache 不能太大)
+    // 1. 我们每次检测 BLOCK_DIM_X * BLOCK_DIM_Y 个圆圈，看是否和矩形相交，筛出相交的，随后按顺序绘图
+    __shared__ bool circleIntersect[BLOCK_DIM_X * BLOCK_DIM_Y];
+
+    // 计算当前处理的像素点，所在的矩形的左边、右边、上边、下边 (单位：像素, 0 开始)
+    short left  = blockIdx.x * blockDim.x;
+    short right = (left + blockDim.x <= imageWidth) ? (left + blockDim.x) : imageWidth;
+    short bot   = blockIdx.y * blockDim.y;
+    short top   = (bot + blockDim.y <= imageHeight) ? (bot + blockDim.y) : imageHeight;
+    // NOTE: 选取大的 y 值作为 “上边”，尽管在图像坐标系中，y 大的值在下方
+
+    // 归一化矩形的四条边
+    float leftNorm  = invWidth * left;
+    float rightNorm = invWidth * right;
+    float topNorm   = invHeight * top;
+    float botNorm   = invHeight * bot;
+
+    // 随后遍历圆形数组，筛出所有与矩形相交、或者在矩形内部的圆 
+    // 每次遍历 BLOCK_DIM_X * BLOCK_DIM_Y 个圆圈
+    for(int circleIndexOffset = 0; circleIndexOffset < cuConstRendererParams.numCircles; circleIndexOffset+=BLOCK_DIM_X*BLOCK_DIM_Y) {
+        // 先清空 circleIntersect 数组
+        circleIntersect[indexInBlock] = 0;
+        __syncthreads(); // 等待所有线程计算完毕
+
+        // 计算当前线程要处理的圆的索引 (如果超出圆数组范围，就skip, 后续涂色还要用到这些线程)
+        int circleIndex = circleIndexOffset + indexInBlock;
+        if(circleIndex < cuConstRendererParams.numCircles) {
+            // 获取当前圆的 float X, float Y, float Radius
+            float3 circlePos = *(float3 *)(&cuConstRendererParams.position[3 * circleIndex]);
+            float circleX = circlePos.x;
+            float circleY = circlePos.y;
+            float rad = cuConstRendererParams.radius[circleIndex];;
+            // 计算当前圆是否和矩形相交或者包含，true 为 1，false 为 0
+            circleIntersect[indexInBlock] = 
+                circleInBox(circleX, circleY, rad, leftNorm, rightNorm, topNorm, botNorm) ||
+                circleInBoxConservative(circleX, circleY, rad, leftNorm, rightNorm, topNorm, botNorm); 
+        }
+
+        __syncthreads(); // 等待所有线程计算完毕
+
+        // 再对矩形内部的像素，遍历 “已经别筛出的圆”，计算颜色。
+        // 只有位于图像内的像素，才进行绘图
+        if(pixelX < imageWidth && pixelY < imageHeight) {
+            // 获取当前像素的颜色数据地址
+            float4 *imagePtr = (float4 *)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+            for(int i = 0; i < BLOCK_DIM_X*BLOCK_DIM_Y; i++) {
+                if(circleIntersect[i]) {
+                    float3 circlePos = *(float3 *)(&cuConstRendererParams.position[3 * (i + circleIndexOffset)]);
+                    shadePixel(i + circleIndexOffset, pixelCenterNorm, circlePos, imagePtr);
+                }
+            }
+        }
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -551,7 +654,6 @@ CudaRenderer::setup() {
     params.numCircles = numCircles;
     params.imageWidth = image->width;
     params.imageHeight = image->height;
-    params.numPixels = image->width * image->height;
     params.position = cudaDevicePosition;
     params.velocity = cudaDeviceVelocity;
     params.color = cudaDeviceColor;
@@ -641,14 +743,16 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
+// 1.把整个图片切块，分成矩形，举个例子，16x16的矩形。矩形里一共有 256 个像素，正好是一个线程块的线程数
+// 2.线程块内所有线程一起计算矩形的上边、下边、左边、右边，随后遍历圆形数组，筛出所有与矩形相交、或者在矩形内部的圆。
+// 3.再对矩形内部的像素，遍历 “已经别筛出的圆”，计算颜色。
 void
 CudaRenderer::render() {
     // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    // 按照像素数量分配线程，像素数 = 线程数
-    // 屏幕像素总数 imageWidth * imageHeight (0起始)
-    int numPixels = image->width * image->height;
-    dim3 gridDim((numPixels + blockDim.x - 1) / blockDim.x);
+    // 16 x 16 = 256 个线程  图像是正方形，那么矩形也用正方形可以避免线程溢出导致浪费
+    dim3 blockDim(BLOCK_DIM_X, BLOCK_DIM_Y);
+    // 按照大矩阵长宽和图像宽高分配线程块维度
+    dim3 gridDim((image->width + blockDim.x - 1) / blockDim.x, (image->height + blockDim.y - 1) / blockDim.y);
     // cuda 渲染核心代码
     kernelRenderCircles<<<gridDim, blockDim>>>();
     // 确保所有之前发出的、与当前设备(GPU)关联的主机(CPU)线程中的 CUDA API 调用都已完成执行。
