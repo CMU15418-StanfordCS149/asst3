@@ -534,6 +534,9 @@ __global__ void kernelRenderCircles() {
                 }
             }
         }
+
+        __syncthreads(); // 绘制完毕之前不能清空 circleIntersect 数组，否则可能会少画一些
+
     }
 }
 
