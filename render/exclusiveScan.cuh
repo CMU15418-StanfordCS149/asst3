@@ -22,7 +22,6 @@
 
 // at the top of the file:
 
-// #define SCAN_BLOCK_DIM   BLOCKSIZE  // needed by sharedMemExclusiveScan implementation
 // #include "exclusiveScan.cu_inl"
 
 // ...

@@ -14,71 +14,14 @@
 #include "sceneLoader.h"
 #include "util.h"
 
-#define BLOCK_DIM_X 16
+#include "circleBoxTest.cuh"
+
+#define BLOCK_DIM_X 16  
 #define BLOCK_DIM_Y 16
+#define BLOCKSIZE   (BLOCK_DIM_X * BLOCK_DIM_Y)  // needed by sharedMemExclusiveScan implementation
+#define SCAN_BLOCK_DIM   BLOCKSIZE  // needed by sharedMemExclusiveScan implementation
 
-// 用于检验 “圆圈是否与矩形相交或被包含” 的函数
-// circleInBoxConservative --
-//
-// Tests whether circle with center (circleX, circleY) and radius
-// `circleRadius` *may intersect* the box defined by coordinates for
-// it's left and right sides, and top and bottom edges.  For
-// efficiency, this is a conservative test.  If it returns 0, then the
-// circle definitely does not intersect the box.  However a result of
-// 1 does not imply an intersection actually exists.  Further tests
-// are needed to determine if an intersection actually exists.  For
-// example, you could continue with actual point in circle tests, or
-// make a subsequent call to circleInBox().
-// Note: For a valid Box, you will want to use boxR >= boxL and 
-// boxT >= boxB. 
-__device__ __inline__ int
-circleInBoxConservative(
-    float circleX, float circleY, float circleRadius,
-    float boxL, float boxR, float boxT, float boxB)
-{
-
-    // expand box by circle radius.  Test if circle center is in the
-    // expanded box.
-
-    if ( circleX >= (boxL - circleRadius) &&
-         circleX <= (boxR + circleRadius) &&
-         circleY >= (boxB - circleRadius) &&
-         circleY <= (boxT + circleRadius) ) {
-        return 1;
-    } else {
-        return 0;
-    }
-}
-
-// 用于检验 “圆圈是否与矩形相交或被包含” 的函数
-// circleInBox --
-//
-// This is a true circle in box test.  It is more expensive than the
-// function circleInBoxConservative above, but it's 1/0 result is a
-// definitive result.
-// Note: For a valid Box, you will want to use boxR >= boxL and 
-// boxT >= boxB. 
-__device__ __inline__ int
-circleInBox(
-    float circleX, float circleY, float circleRadius,
-    float boxL, float boxR, float boxT, float boxB)
-{
-
-    // clamp circle center to box (finds the closest point on the box)
-    float closestX = (circleX > boxL) ? ((circleX < boxR) ? circleX : boxR) : boxL;
-    float closestY = (circleY > boxB) ? ((circleY < boxT) ? circleY : boxT) : boxB;
-
-    // is circle radius less than the distance to the closest point on
-    // the box?
-    float distX = closestX - circleX;
-    float distY = closestY - circleY;
-
-    if ( ((distX*distX) + (distY*distY)) <= (circleRadius*circleRadius) ) {
-        return 1;
-    } else {
-        return 0;
-    }
-}
+#include "exclusiveScan.cuh"
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -484,7 +427,12 @@ __global__ void kernelRenderCircles() {
 
     // 线程块内线程共享的共享内存，包括: (线程块的共享内存 L1 cache 不能太大)
     // 1. 我们每次检测 BLOCK_DIM_X * BLOCK_DIM_Y 个圆圈，看是否和矩形相交，筛出相交的，随后按顺序绘图
-    __shared__ bool circleIntersect[BLOCK_DIM_X * BLOCK_DIM_Y];
+    // 2. 并行前缀和的输出数组
+    // 3. 用于计算的临时空间
+    __shared__ uint circleIntersectBool[SCAN_BLOCK_DIM];
+    __shared__ uint circleIntersectNum[SCAN_BLOCK_DIM];
+    __shared__ uint tmpSpace[2*SCAN_BLOCK_DIM];
+    __shared__ uint circleIntersectIndex[SCAN_BLOCK_DIM];
 
     // 计算当前处理的像素点，所在的矩形的左边、右边、上边、下边 (单位：像素, 0 开始)
     short left  = blockIdx.x * blockDim.x;
@@ -501,9 +449,16 @@ __global__ void kernelRenderCircles() {
 
     // 随后遍历圆形数组，筛出所有与矩形相交、或者在矩形内部的圆 
     // 每次遍历 BLOCK_DIM_X * BLOCK_DIM_Y 个圆圈
-    for(int circleIndexOffset = 0; circleIndexOffset < cuConstRendererParams.numCircles; circleIndexOffset+=BLOCK_DIM_X*BLOCK_DIM_Y) {
-        // 先清空 circleIntersect 数组
-        circleIntersect[indexInBlock] = 0;
+    for(int circleIndexOffset = 0; circleIndexOffset < cuConstRendererParams.numCircles; circleIndexOffset+=BLOCKSIZE) {
+        // 先清空 circleIntersectBool 数组
+        circleIntersectBool[indexInBlock] = 0;
+        // 清空 circleIntersectNum 数组
+        circleIntersectNum[indexInBlock] = 0;
+        // 清空 tmpSpace 数组
+        tmpSpace[2*indexInBlock] = 0;
+        tmpSpace[2*indexInBlock+1] = 0;
+        // 清空 circleIntersectIndex 数组
+        circleIntersectIndex[indexInBlock] = 0;
         __syncthreads(); // 等待所有线程计算完毕
 
         // 计算当前线程要处理的圆的索引 (如果超出圆数组范围，就skip, 后续涂色还要用到这些线程)
@@ -515,27 +470,35 @@ __global__ void kernelRenderCircles() {
             float circleY = circlePos.y;
             float rad = cuConstRendererParams.radius[circleIndex];;
             // 计算当前圆是否和矩形相交或者包含，true 为 1，false 为 0
-            circleIntersect[indexInBlock] = 
+            circleIntersectBool[indexInBlock] = 
                 circleInBox(circleX, circleY, rad, leftNorm, rightNorm, topNorm, botNorm) ||
                 circleInBoxConservative(circleX, circleY, rad, leftNorm, rightNorm, topNorm, botNorm); 
         }
 
-        __syncthreads(); // 等待所有线程计算完毕
+        __syncthreads(); // 等待所有线程计算完毕 (此时已经得到了 0，1 组成的 circleIntersectBool 数组)
+
+        // 并行前缀和
+        sharedMemExclusiveScan(indexInBlock, circleIntersectBool, circleIntersectNum, tmpSpace, SCAN_BLOCK_DIM);
+        // 收集变化的下标
+        if(circleIntersectBool[indexInBlock])
+            circleIntersectIndex[circleIntersectNum[indexInBlock]] = indexInBlock;
+        __syncthreads(); // 等待所有线程计算完毕 (此时得到了装满下标的 tmpSpace 数组) 复用 tmpSpace 数组
+
+        // 计算出相交圆的数量
+        int numCirclesIntersect = circleIntersectBool[SCAN_BLOCK_DIM - 1] + circleIntersectNum[SCAN_BLOCK_DIM - 1];
 
         // 再对矩形内部的像素，遍历 “已经别筛出的圆”，计算颜色。
         // 只有位于图像内的像素，才进行绘图
         if(pixelX < imageWidth && pixelY < imageHeight) {
             // 获取当前像素的颜色数据地址
             float4 *imagePtr = (float4 *)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
-            for(int i = 0; i < BLOCK_DIM_X*BLOCK_DIM_Y; i++) {
-                if(circleIntersect[i]) {
-                    float3 circlePos = *(float3 *)(&cuConstRendererParams.position[3 * (i + circleIndexOffset)]);
-                    shadePixel(i + circleIndexOffset, pixelCenterNorm, circlePos, imagePtr);
-                }
+            for(int i = 0; i < numCirclesIntersect; i++) {
+                float3 circlePos = *(float3 *)(&cuConstRendererParams.position[3 * (circleIntersectIndex[i] + circleIndexOffset)]);
+                shadePixel(circleIntersectIndex[i] + circleIndexOffset, pixelCenterNorm, circlePos, imagePtr);
             }
         }
 
-        __syncthreads(); // 绘制完毕之前不能清空 circleIntersect 数组，否则可能会少画一些
+        __syncthreads(); // 绘制完毕之前不能清空 circleIntersectBool 数组，否则可能会少画一些
 
     }
 }
