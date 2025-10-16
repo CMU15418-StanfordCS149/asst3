@@ -8,6 +8,9 @@
 #include <cuda_runtime.h>
 #include <driver_functions.h>
 
+#include <thrust/device_ptr.h>
+#include <thrust/scan.h>
+
 #include "cudaRenderer.h"
 #include "image.h"
 #include "noise.h"
@@ -22,6 +25,7 @@
 #define SCAN_BLOCK_DIM   BLOCKSIZE  // needed by sharedMemExclusiveScan implementation
 
 #include "exclusiveScan.cuh"
+#include <cassert>
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -406,13 +410,13 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 // 1.把整个图片切块，分成矩形，举个例子，16x16的矩形。矩形里一共有 256 个像素，正好是一个线程块的线程数
 // 2.线程块内所有线程一起计算矩形的上边、下边、左边、右边，随后遍历圆形数组，筛出所有与矩形相交、或者在矩形内部的圆。
 // 3.再对矩形内部的像素，遍历 “已经别筛出的圆”，计算颜色。
-__global__ void kernelRenderCircles() {
+__global__ void kernelRenderCircles(int startX, int startY, int *intersectCircles, int numCircles) {
     // 计算线程块内的索引
     int indexInBlock = blockDim.x*threadIdx.y + threadIdx.x;
     // 计算像素点的 x, y
-    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
-    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
-    
+    int pixelX = (startX*16 + blockIdx.x) * blockDim.x + threadIdx.x;
+    int pixelY = (startY*16 + blockIdx.y) * blockDim.y + threadIdx.y;
+
     short imageWidth  = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
     // 过滤掉越界的线程 (NOTE: 这里不能过滤掉越界的线程，因为需要这些线程完成圆圈矩阵相交的运算，绘图时再过滤即可)
@@ -435,9 +439,9 @@ __global__ void kernelRenderCircles() {
     __shared__ uint circleIntersectIndex[SCAN_BLOCK_DIM];
 
     // 计算当前处理的像素点，所在的矩形的左边、右边、上边、下边 (单位：像素, 0 开始)
-    short left  = blockIdx.x * blockDim.x;
+    short left  = (startX*16 + blockIdx.x) * blockDim.x;
     short right = (left + blockDim.x <= imageWidth) ? (left + blockDim.x) : imageWidth;
-    short bot   = blockIdx.y * blockDim.y;
+    short bot   = (startY*16 + blockIdx.y) * blockDim.y;
     short top   = (bot + blockDim.y <= imageHeight) ? (bot + blockDim.y) : imageHeight;
     // NOTE: 选取大的 y 值作为 “上边”，尽管在图像坐标系中，y 大的值在下方
 
@@ -449,6 +453,161 @@ __global__ void kernelRenderCircles() {
 
     // 随后遍历圆形数组，筛出所有与矩形相交、或者在矩形内部的圆 
     // 每次遍历 BLOCK_DIM_X * BLOCK_DIM_Y 个圆圈
+    for(int circleIndexOffset = 0; circleIndexOffset < numCircles; circleIndexOffset+=BLOCKSIZE) {
+        // 先清空 circleIntersectBool 数组
+        circleIntersectBool[indexInBlock] = 0;
+        // 清空 circleIntersectNum 数组
+        circleIntersectNum[indexInBlock] = 0;
+        // 清空 tmpSpace 数组
+        tmpSpace[2*indexInBlock] = 0;
+        tmpSpace[2*indexInBlock+1] = 0;
+        // 清空 circleIntersectIndex 数组
+        circleIntersectIndex[indexInBlock] = 0;
+        __syncthreads(); // 等待所有线程计算完毕
+
+        // 计算当前线程要处理的圆的索引 (如果超出圆数组范围，就skip, 后续涂色还要用到这些线程)
+        int circleIndex = circleIndexOffset + indexInBlock;
+        if(circleIndex < numCircles) {
+            int realcircleIndex = intersectCircles[circleIndex];
+            assert(realcircleIndex < cuConstRendererParams.numCircles);
+            // 获取当前圆的 float X, float Y, float Radius
+            float3 circlePos = *(float3 *)(&cuConstRendererParams.position[3 * realcircleIndex]);
+            float circleX = circlePos.x;
+            float circleY = circlePos.y;
+            float rad = cuConstRendererParams.radius[realcircleIndex];;
+            // 计算当前圆是否和矩形相交或者包含，true 为 1，false 为 0
+
+            circleIntersectBool[indexInBlock] = 
+                circleInBox(circleX, circleY, rad, leftNorm, rightNorm, topNorm, botNorm);
+        }
+
+        __syncthreads(); // 等待所有线程计算完毕 (此时已经得到了 0，1 组成的 circleIntersectBool 数组)
+
+        // 并行前缀和
+        sharedMemExclusiveScan(indexInBlock, circleIntersectBool, circleIntersectNum, tmpSpace, SCAN_BLOCK_DIM);
+        // 收集变化的下标
+        if(circleIntersectBool[indexInBlock])
+            circleIntersectIndex[circleIntersectNum[indexInBlock]] = indexInBlock;
+        __syncthreads(); // 等待所有线程计算完毕 (此时得到了装满下标的 tmpSpace 数组) 复用 tmpSpace 数组
+
+        // 计算出相交圆的数量
+        int numCirclesIntersect = circleIntersectBool[SCAN_BLOCK_DIM - 1] + circleIntersectNum[SCAN_BLOCK_DIM - 1];
+
+        // 再对矩形内部的像素，遍历 “已经别筛出的圆”，计算颜色。
+        // 只有位于图像内的像素，才进行绘图
+        if(pixelX < imageWidth && pixelY < imageHeight) {
+            // 获取当前像素的颜色数据地址
+            float4 *imagePtr = (float4 *)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+            float4 imageData = *imagePtr;
+            for(int i = 0; i < numCirclesIntersect; i++) {
+                uint realindex = intersectCircles[circleIndexOffset + circleIntersectIndex[i]];
+                float3 circlePos = *(float3 *)(&cuConstRendererParams.position[3 * realindex]);
+                shadePixel(realindex, pixelCenterNorm, circlePos, &imageData);
+            }
+            *imagePtr = imageData;
+        }
+
+        __syncthreads(); // 绘制完毕之前不能清空 circleIntersectBool 数组，否则可能会少画一些
+
+    }
+}
+
+__global__ void kernelCountIntersections(int *numCirclesBigBlocks, int numBlocks) {
+    // 计算当前CUDA线程在线程块内的索引
+    int indexInBlock = blockDim.x * threadIdx.y + threadIdx.x;
+    // 计算当前线程块在网格中的索引
+    int blockId = blockIdx.y * gridDim.x + blockIdx.x;
+
+    short imageWidth  = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth  = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    // 计算归一化的矩形左右上下边
+    short left  = blockIdx.x * blockDim.x * 16;
+    short right = (left + blockDim.x * 16 <= imageWidth) ? (left + blockDim.x * 16) : imageWidth;
+    short bot   = blockIdx.y * blockDim.y * 16;
+    short top   = (bot + blockDim.y * 16 <= imageHeight) ? (bot + blockDim.y * 16) : imageHeight;
+    float leftNorm  = invWidth * left;
+    float rightNorm = invWidth * right;
+    float topNorm   = invHeight * top;
+    float botNorm   = invHeight * bot;
+
+    __shared__ uint circleIntersectBool[SCAN_BLOCK_DIM];
+    __shared__ uint circleIntersectNum[SCAN_BLOCK_DIM];
+    __shared__ uint tmpSpace[2*SCAN_BLOCK_DIM];
+    // __shared__ uint circleIntersectIndex[SCAN_BLOCK_DIM]; 纯计数，不需要它
+
+    // 重置计数内存
+    if(0 == indexInBlock) {
+        numCirclesBigBlocks[blockId] = 0;
+    }
+
+    for(int circleIndexOffset = 0; circleIndexOffset < cuConstRendererParams.numCircles; circleIndexOffset+=BLOCKSIZE) {
+        // 先清空 circleIntersectBool 数组
+        circleIntersectBool[indexInBlock] = 0;
+        // 清空 circleIntersectNum 数组
+        circleIntersectNum[indexInBlock] = 0;
+        // 清空 tmpSpace 数组
+        tmpSpace[2*indexInBlock] = 0;
+        tmpSpace[2*indexInBlock+1] = 0;
+        __syncthreads(); // 等待所有线程计算完毕
+
+        // 计算当前线程要处理的圆的索引 (如果超出圆数组范围，就skip, 后续涂色还要用到这些线程)
+        int circleIndex = circleIndexOffset + indexInBlock;
+        if(circleIndex < cuConstRendererParams.numCircles) {
+            // 获取当前圆的 float X, float Y, float Radius
+            float3 circlePos = *(float3 *)(&cuConstRendererParams.position[3 * circleIndex]);
+            float circleX = circlePos.x;
+            float circleY = circlePos.y;
+            float rad = cuConstRendererParams.radius[circleIndex];;
+            // 计算当前圆是否和矩形相交或者包含，true 为 1，false 为 0
+            circleIntersectBool[indexInBlock] = 
+                circleInBox(circleX, circleY, rad, leftNorm, rightNorm, topNorm, botNorm);
+        }
+        __syncthreads(); // 等待所有线程计算完毕 (此时已经得到了 0，1 组成的 circleIntersectBool 数组)
+
+        // 并行前缀和
+        sharedMemExclusiveScan(indexInBlock, circleIntersectBool, circleIntersectNum, tmpSpace, SCAN_BLOCK_DIM);
+        __syncthreads(); // 等待所有线程计算完毕 (此时得到了装满下标的 tmpSpace 数组) 
+
+        int numCirclesIntersect = circleIntersectBool[SCAN_BLOCK_DIM - 1] + circleIntersectNum[SCAN_BLOCK_DIM - 1];
+        // 每个线程块只有一个线程往输出数组写入东西
+        if(0 == indexInBlock) {
+            // 增加相交圆个数
+            numCirclesBigBlocks[blockId] += numCirclesIntersect;
+        }
+        // 统计结束之前不能清空共享内存
+        __syncthreads();
+    }
+}
+
+__global__ void kernelCollectIntersections(int startX, int startY, int *intersectCircles, int numCircles) {
+    // 计算当前CUDA线程在线程块内的索引
+    int indexInBlock = blockDim.x * threadIdx.y + threadIdx.x;
+
+    short imageWidth  = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth  = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    // 计算归一化的矩形左右上下边
+    short left  = startX * blockDim.x * 16;
+    short right = (left + blockDim.x * 16 <= imageWidth) ? (left + blockDim.x * 16) : imageWidth;
+    short bot   = startY * blockDim.y * 16;
+    short top   = (bot + blockDim.y * 16 <= imageHeight) ? (bot + blockDim.y * 16) : imageHeight;
+    float leftNorm  = invWidth * left;
+    float rightNorm = invWidth * right;
+    float topNorm   = invHeight * top;
+    float botNorm   = invHeight * bot;
+
+    __shared__ uint circleIntersectBool[SCAN_BLOCK_DIM];
+    __shared__ uint circleIntersectNum[SCAN_BLOCK_DIM];
+    __shared__ uint tmpSpace[2*SCAN_BLOCK_DIM];
+    __shared__ uint circleIntersectIndex[SCAN_BLOCK_DIM]; 
+
+    int total = 0;
+
     for(int circleIndexOffset = 0; circleIndexOffset < cuConstRendererParams.numCircles; circleIndexOffset+=BLOCKSIZE) {
         // 先清空 circleIntersectBool 数组
         circleIntersectBool[indexInBlock] = 0;
@@ -471,10 +630,8 @@ __global__ void kernelRenderCircles() {
             float rad = cuConstRendererParams.radius[circleIndex];;
             // 计算当前圆是否和矩形相交或者包含，true 为 1，false 为 0
             circleIntersectBool[indexInBlock] = 
-                circleInBox(circleX, circleY, rad, leftNorm, rightNorm, topNorm, botNorm) ||
-                circleInBoxConservative(circleX, circleY, rad, leftNorm, rightNorm, topNorm, botNorm); 
+                circleInBox(circleX, circleY, rad, leftNorm, rightNorm, topNorm, botNorm);
         }
-
         __syncthreads(); // 等待所有线程计算完毕 (此时已经得到了 0，1 组成的 circleIntersectBool 数组)
 
         // 并行前缀和
@@ -482,29 +639,25 @@ __global__ void kernelRenderCircles() {
         // 收集变化的下标
         if(circleIntersectBool[indexInBlock])
             circleIntersectIndex[circleIntersectNum[indexInBlock]] = indexInBlock;
-        __syncthreads(); // 等待所有线程计算完毕 (此时得到了装满下标的 tmpSpace 数组) 复用 tmpSpace 数组
+        __syncthreads(); // 等待所有线程计算完毕 (此时得到了装满下标的 tmpSpace 数组) 
 
-        // 计算出相交圆的数量
         int numCirclesIntersect = circleIntersectBool[SCAN_BLOCK_DIM - 1] + circleIntersectNum[SCAN_BLOCK_DIM - 1];
-
-        // 再对矩形内部的像素，遍历 “已经别筛出的圆”，计算颜色。
-        // 只有位于图像内的像素，才进行绘图
-        if(pixelX < imageWidth && pixelY < imageHeight) {
-            // 获取当前像素的颜色数据地址
-            float4 *imagePtr = (float4 *)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
-            float4 imageData = *imagePtr;
+        if(0 == indexInBlock) {
+            assert(total <= numCircles);
+            assert(total + numCirclesIntersect <= numCircles);
             for(int i = 0; i < numCirclesIntersect; i++) {
-                uint index = circleIntersectIndex[i];
-                float3 circlePos = *(float3 *)(&cuConstRendererParams.position[3 * (index + circleIndexOffset)]);
-                shadePixel(index + circleIndexOffset, pixelCenterNorm, circlePos, &imageData);
+                intersectCircles[total] = circleIntersectIndex[i] + circleIndexOffset;
+                total++;
             }
-            *imagePtr = imageData;
+            assert(total <= numCircles);
         }
-
-        __syncthreads(); // 绘制完毕之前不能清空 circleIntersectBool 数组，否则可能会少画一些
-
+        // 统计结束之前不能清空共享内存
+        __syncthreads();
     }
+    assert(0 != indexInBlock || total == numCircles);
 }
+
+// 替换：原来的 kernelSplitImage 已被移除 — 上面两阶段实现替代其功能（只负责产出紧凑的相交圆索引数组）
 
 ////////////////////////////////////////////////////////////////////////////////////////
 
@@ -712,18 +865,68 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
+// 0. 先进行大矩阵分块，再做下面的小矩阵渲染
 // 1.把整个图片切块，分成矩形，举个例子，16x16的矩形。矩形里一共有 256 个像素，正好是一个线程块的线程数
 // 2.线程块内所有线程一起计算矩形的上边、下边、左边、右边，随后遍历圆形数组，筛出所有与矩形相交、或者在矩形内部的圆。
 // 3.再对矩形内部的像素，遍历 “已经别筛出的圆”，计算颜色。
 void
 CudaRenderer::render() {
-    // 256 threads per block is a healthy number
-    // 16 x 16 = 256 个线程  图像是正方形，那么矩形也用正方形可以避免线程溢出导致浪费
+    // 所有内核函数的线程块大小一致
     dim3 blockDim(BLOCK_DIM_X, BLOCK_DIM_Y);
-    // 按照大矩阵长宽和图像宽高分配线程块维度
-    dim3 gridDim((image->width + blockDim.x - 1) / blockDim.x, (image->height + blockDim.y - 1) / blockDim.y);
-    // cuda 渲染核心代码
-    kernelRenderCircles<<<gridDim, blockDim>>>();
-    // 确保所有之前发出的、与当前设备(GPU)关联的主机(CPU)线程中的 CUDA API 调用都已完成执行。
-    cudaDeviceSynchronize();
+    // 大矩阵分块网格
+    dim3 gridDimSplit((image->width + blockDim.x - 1) / (blockDim.x * 16), (image->height + blockDim.y - 1) / (blockDim.y * 16));
+    // 分块网格的维度(线程块的个数)
+    int numBlocks = gridDimSplit.x * gridDimSplit.y;
+    // 用来统计每个大块有多少圆相交
+    int *numCirclesBigBlocks = nullptr;
+    cudaMalloc(&numCirclesBigBlocks, numBlocks * sizeof(int));
+    cudaMemset(numCirclesBigBlocks, 0, numBlocks * sizeof(int));
+
+    // 1st pass: 统计每个大块有多少圆相交 ==================================================================== step1
+    kernelCountIntersections<<<gridDimSplit, blockDim>>>(numCirclesBigBlocks, numBlocks);
+    cudaDeviceSynchronize(); // CPU 等待 GPU 计算完毕
+
+    // 2nd pass: ================================================================================= step2
+    // 根据 1st pass 的结果为每个大块分配内存，内存用于存储每个大块的相交圆索引
+    int *numCirclesBigBlocksHost = new int[numBlocks];
+    cudaMemcpy(numCirclesBigBlocksHost, numCirclesBigBlocks, sizeof(int)*numBlocks, cudaMemcpyDeviceToHost);
+    int **numCircleEachBigBlock = new int*[numBlocks];
+    for(int i = 0; i < numBlocks; i++) {
+        if (numCirclesBigBlocksHost[i] > 0) {
+            cudaMalloc(&numCircleEachBigBlock[i], sizeof(int) * numCirclesBigBlocksHost[i]);
+        } else {
+            numCircleEachBigBlock[i] = nullptr;
+        }
+    }
+    // 2nd pass: 把每个大块的相交圆索引写入到各自的内存中
+    for(int i = 0; i < numBlocks; i++) {
+        if (numCirclesBigBlocksHost[i] > 0) {
+            int startX = i % gridDimSplit.x;
+            int startY = i / gridDimSplit.x;
+            kernelCollectIntersections<<<1, blockDim>>>(startX, startY, numCircleEachBigBlock[i], numCirclesBigBlocksHost[i]);
+        }
+    }
+    cudaDeviceSynchronize(); // CPU 等待 GPU 计算完毕
+
+    // 3rd pass: 渲染 ================================================================================= step3
+    for(int i = 0; i < numBlocks; i++) {
+        if (numCirclesBigBlocksHost[i] > 0) {
+            int startX = i % gridDimSplit.x;
+            int startY = i / gridDimSplit.x;
+            // 渲染当前大块
+            dim3 gridDimRenderBlock(16, 16);
+            kernelRenderCircles<<<gridDimRenderBlock, blockDim>>>(startX, startY, numCircleEachBigBlock[i], numCirclesBigBlocksHost[i]);
+        }
+    }
+    cudaDeviceSynchronize(); // CPU 等待 GPU 计算完毕
+
+    // 释放内存
+    cudaFree(numCirclesBigBlocks);
+    delete [] numCirclesBigBlocksHost;
+    for(int i = 0; i < numBlocks; i++) {
+        if (numCircleEachBigBlock[i]) {
+            cudaFree(numCircleEachBigBlock[i]);
+        }
+    }
+    delete [] numCircleEachBigBlock;
 }

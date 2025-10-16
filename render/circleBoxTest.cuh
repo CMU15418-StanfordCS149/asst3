@@ -14,6 +14,7 @@
 // boxT >= boxB. 
 __device__ __inline__ int
 circleInBoxConservative(
+    // int blockId,
     float circleX, float circleY, float circleRadius,
     float boxL, float boxR, float boxT, float boxB)
 {
@@ -25,6 +26,9 @@ circleInBoxConservative(
          circleX <= (boxR + circleRadius) &&
          circleY >= (boxB - circleRadius) &&
          circleY <= (boxT + circleRadius) ) {
+        // printf("in conservative, blockId = %d\n", blockId);
+        // printf("boxL - circleRadius = %f, boxR + circleRadius = %f, boxB - circleRadius = %f, boxT + circleRadius = %f\n", 
+        //     boxL - circleRadius, boxR + circleRadius, boxB - circleRadius, boxT + circleRadius);
         return 1;
     } else {
         return 0;
@@ -41,6 +45,7 @@ circleInBoxConservative(
 // boxT >= boxB. 
 __device__ __inline__ int
 circleInBox(
+    // int blockId,
     float circleX, float circleY, float circleRadius,
     float boxL, float boxR, float boxT, float boxB)
 {
@@ -55,6 +60,15 @@ circleInBox(
     float distY = closestY - circleY;
 
     if ( ((distX*distX) + (distY*distY)) <= (circleRadius*circleRadius) ) {
+        // if(0 == blockId) {
+        //     printf("blockId = %d\n", blockId);
+        //     printf("circleInBox: circleX = %f, circleY = %f, circleRadius = %f, boxL = %f, boxR = %f, boxT = %f, boxB = %f\n", 
+        //         circleX, circleY, circleRadius, boxL, boxR, boxT, boxB);
+        //     printf("circleInBox: closestX = %f, closestY = %f\n", closestX, closestY);
+        //     printf("circleInBox: distX = %f, distY = %f\n", distX, distY);
+        //     printf("circleInBox: (distX*distX) + (distY*distY) = %f, (circleRadius*circleRadius) = %f\n", 
+        //         (distX*distX) + (distY*distY), (circleRadius*circleRadius));
+        // }
         return 1;
     } else {
         return 0;
