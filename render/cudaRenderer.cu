@@ -492,10 +492,13 @@ __global__ void kernelRenderCircles() {
         if(pixelX < imageWidth && pixelY < imageHeight) {
             // 获取当前像素的颜色数据地址
             float4 *imagePtr = (float4 *)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+            float4 imageData = *imagePtr;
             for(int i = 0; i < numCirclesIntersect; i++) {
-                float3 circlePos = *(float3 *)(&cuConstRendererParams.position[3 * (circleIntersectIndex[i] + circleIndexOffset)]);
-                shadePixel(circleIntersectIndex[i] + circleIndexOffset, pixelCenterNorm, circlePos, imagePtr);
+                uint index = circleIntersectIndex[i];
+                float3 circlePos = *(float3 *)(&cuConstRendererParams.position[3 * (index + circleIndexOffset)]);
+                shadePixel(index + circleIndexOffset, pixelCenterNorm, circlePos, &imageData);
             }
+            *imagePtr = imageData;
         }
 
         __syncthreads(); // 绘制完毕之前不能清空 circleIntersectBool 数组，否则可能会少画一些
